@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pickagm"
+version = "0.1.0"
+description = "A Python library for selecting ground motions for nonlinear structural response analysis under earthquake loading."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "GNU General Public License v3.0" }
+authors = [
+    { name = "Your Name", email = "your.email@example.com" }
+]
+keywords = ["earthquake", "ground motion", "nonlinear analysis", "seismic", "engineering"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Civil Engineering",
+]
+
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "matplotlib>=3.8.2",
+]
+
+[project.optional-dependencies]
+
+[project.urls]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pickagm = ["data/*.csv"]
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.ruff]
+select = ["E", "F"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
