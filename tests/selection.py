@@ -91,7 +91,7 @@ realisations = np.exp(realisations)
 # plt.show()
 
 component_tags = ["U", "V"]
-eqdf = eqdb.load_esm_flatfile(2000)
+eqdf = eqdb.load_esm_flatfile()
 eqdf = eqdb.filter_imt_data_esm(eqdf, imts)
 
 ims_of_selected_gms: pd.DataFrame = sel.best_individual_components(
