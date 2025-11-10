@@ -11,7 +11,19 @@ import importlib.resources as res
 from scipy import stats
 from scipy.stats._distn_infrastructure import rv_frozen
 
+from pickagm.dfops import interpolate_for_sa
+
 NormalRV = rv_frozen  # alias for readability
+
+SCALING_EXPONENTS = {
+    "SA": 1.0,
+    "PGA": 1.0,
+    "PGV": 1.0,
+    "RSD595": 0,
+    "CAV": 1.0,
+    "IA": 2.0
+    }
+
 
 class IMDistribution:
     """
@@ -145,7 +157,7 @@ class CorrelationModel:
                 # try to interpolate column for the missing SA(im1)
                 T1 = im1.period
                 # Series indexed by rows (conditioning IMs)
-                im_series = interpolate_correlations_for_sa(self.corr, T1)  
+                im_series = interpolate_for_sa(self.corr, T1)  
 
                 # If the conditioning IM exists in the index, return directly
                 if str(conditioning_im) in im_series.index:
@@ -258,78 +270,6 @@ def load_correlation_model(correlation_model: str,
     return df
 
 
-def interpolate_correlations_for_sa(
-        df: pd.DataFrame | pd.Series, T, im_prefix="SA"):
-    """
-    Interpolate correlation values for spectral accelerations.
-
-    - If `df` is a DataFrame: returns a pandas.Series (for scalar T) or 
-      DataFrame (for multiple T)
-      containing the interpolated column(s) indexed by the original rows.
-    - If `df` is a Series: returns a single float (T must be scalar).
-
-    Parameters
-    ----------
-    df : pandas.DataFrame or pandas.Series
-        Data containing SA columns like "SA(0.02s)", "SA(0.05s)", ...
-        If DataFrame, interpolation is performed for each row independently.
-        If Series, interpolation is performed on that single series.
-    T : float or array-like
-        Target period(s) [s] for which to interpolate SA.
-    im_prefix : str, default="SA"
-        The prefix identifying the spectral acceleration columns.
-    """
-    pattern = re.compile(rf"{im_prefix}\(([\d.]+)\)")
-
-    # Helper to extract mapping period -> column/key
-    def _extract_keys_from_labels(labels):
-        keys = {float(m.group(1)): lbl for lbl in labels 
-                if (m := pattern.match(lbl))}
-        if not keys:
-            raise ValueError(f"No columns/labels found for IM type "
-                             f"'{im_prefix}'")
-        periods_sorted = np.array(sorted(keys.keys()))
-        cols_sorted = [keys[p] for p in periods_sorted]
-        return periods_sorted, cols_sorted
-
-    T_arr = np.atleast_1d(T)
-
-    # Case: Series input -> return a single float (require scalar T)
-    if isinstance(df, pd.Series):
-        if T_arr.size != 1:
-            raise ValueError("When input is a Series, T must be a scalar value")
-        periods, keys = _extract_keys_from_labels(df.index)
-        values = np.array([float(df[k]) for k in keys])
-        interp_val = np.interp(
-            float(T_arr[0]), periods, values, left=np.nan, right=np.nan)
-        if np.isnan(interp_val):
-            raise ValueError(f"Could not interpolate SA at T={T_arr[0]}")
-        return float(interp_val)
-
-    # Case: DataFrame input -> return Series (for scalar T) or DataFrame 
-    # (for multiple T)
-    if isinstance(df, pd.DataFrame):
-        periods, cols = _extract_keys_from_labels(df.columns)
-        corr_data = df[cols].to_numpy()  # shape: (n_rows, n_periods)
-
-        results = {}
-        for t in T_arr:
-            # interpolate each row along the SA-period axis
-            interp_vals = np.apply_along_axis(
-                lambda row: np.interp(
-                    float(t), periods, row, left=np.nan, right=np.nan),
-                axis=1,
-                arr=corr_data
-            )
-            col_name = f"{im_prefix}({float(t):.3f})"
-            results[col_name] = interp_vals
-
-        res_df = pd.DataFrame(results, index=df.index).map(float)
-        return res_df.iloc[:, 0] if res_df.shape[1] == 1 else res_df
-
-    raise TypeError("df must be a pandas.DataFrame or pandas.Series")
-
-
 def correlation_matrix(
         list_of_imts: list[IMT], correlation_model: CorrelationModel,
         conditioning_imt: IMT|None=None, incl_conditioning_imt: bool=False
@@ -372,7 +312,7 @@ def correlation_matrix(
     SA_imts_not_in_model = [imt for imt in SA_imts_not_in_model 
                             if str(imt).startswith("SA")]
     for imt in SA_imts_not_in_model:
-        interp_values = interpolate_correlations_for_sa(
+        interp_values = interpolate_for_sa(
             correlation_model.correlations, period_from_SA_IMT_str(str(imt))
         )
         
@@ -536,9 +476,12 @@ def get_cs(imt_distributions: list[IMDistribution],
 
 
 def sample_im_distribution(
-        mean_vec: pd.Series, covariance_matrix: pd.DataFrame, n: int=1
+        mean_vec: pd.Series, covariance_matrix: pd.DataFrame, n: int=1,
+        seed: int|None=None
         ) -> pd.DataFrame:
     """ use 'svd' method so that the semi-definite problem can be solved
+    the return samples are in the form ln(IM). To get the true im value they
+    need to be exponentiated IM = exp(ln(IM))
 
     Args:
         mean_vec (pd.Series): _description_
@@ -549,12 +492,14 @@ def sample_im_distribution(
         pd.DataFrame: _description_
     """
     labels = mean_vec.index
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(seed)
     realisation = rng.multivariate_normal(
         mean_vec.to_numpy(), covariance_matrix.to_numpy(), 
         size=n, method="svd")
 
-    return pd.DataFrame(realisation.T, index=labels)
+    columns = [f"s{ii+1}" for ii in range(0,n)]
+
+    return pd.DataFrame(realisation.T, index=labels, columns=columns).T
 
 
 def get_empirical_cdfs(df: pd.DataFrame) -> pd.Series:
