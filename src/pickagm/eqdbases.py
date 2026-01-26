@@ -19,7 +19,8 @@ esm_nonSA_im_translations = {
     "pgv": str(PGV()),
     "T90": str(RSD595()),
     "CAV": str(CAV()),
-    "ia": str(IA())
+    "ia": str(IA()),
+    "pgd": "PGD"
 }
 
 esm_unit_conversions = {
@@ -82,7 +83,7 @@ def rename_sa_columns_esm(df: pd.DataFrame) -> pd.DataFrame:
     The numeric part is parsed as a float for consistent formatting.
     """
     def rename_col(col: str) -> str:
-        match = re.fullmatch(r'([UVW])_T(\d{1,2})_(\d+)', col)
+        match = re.fullmatch(r'(\w+)_T(\d{1,2})_(\d+)', col)
         if match:
             comp, int_part, dec_part = match.groups()
             period = float(f"{int_part}.{dec_part}")
@@ -134,3 +135,24 @@ def scale_columns_for_units(
         mask = df.columns.get_level_values(1).str.startswith(tag)
         df.loc[:,mask] *= sf
     return df
+
+
+def extract_im_data(df: pd.DataFrame, idx_im_data: int):
+    im_df = df[df.columns[idx_im_data:]]
+    return im_df
+
+
+def extract_metadata(flatfile_df: pd.DataFrame, idx_im_data: int):
+    return flatfile_df[flatfile_df.columns[:idx_im_data]]
+
+
+def expand_SA_column_names(col_names: list[str]):
+    pattern = re.compile(rf"SA\(([\d.]+)\)")
+    new_names = []
+    for c in col_names:
+        cs = c.split("_")
+        m = pattern.search(c[1])
+        if m: t = float(m.group(1))
+        else: t = "None"
+        new_names.append((cs[0], "SA", t))
+    return new_names
