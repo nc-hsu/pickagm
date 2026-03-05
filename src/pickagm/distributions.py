@@ -9,8 +9,16 @@ from openquake.hazardlib.gsim.base import GMPE
 import pandas as pd
 import importlib.resources as res
 from scipy import stats
+from scipy.optimize import brentq
 from scipy.stats._distn_infrastructure import rv_frozen
 
+from pickagm.typing import GmmMap, CorrMap, IMTName 
+from pickagm.corrmodels import conditional_correlation_matrix
+from pickagm.contexts import (
+    SiteRupContextBuilder, 
+    get_rup_ctxs, 
+    get_site_rup_ctxs
+    )
 from pickagm.dfops import interpolate_for_sa
 
 NormalRV = rv_frozen  # alias for readability
@@ -21,498 +29,429 @@ SCALING_EXPONENTS = {
     "PGV": 1.0,
     "RSD595": 0,
     "CAV": 1.0,
-    "IA": 2.0
+    "IA": 2.0,
+    "AvgSA": 1.0
     }
 
 
-class IMDistribution:
-    """
-    Target distribution for a ground motion intensity measure.
-    """
+def gcim_distributions(disagg_dst: pd.DataFrame,
+                       imtl: float,
+                       gmm_map: GmmMap, 
+                       selection_imts: list[IMT],
+                       conditioning_imt: IMT, 
+                       corr_model_map: CorrMap,
+                       ctx_builder: SiteRupContextBuilder,
+                       occurence: bool,
+                       percentiles=[0.16, 0.5, 0.84],
+                       n_pts=200):
+    # Disagg data must have columns "TRT", "Mag", "Dist"
+    # Only a full disaggregation including TRT is implemented and the results
+    disagg_type = "TRT_Mag_Dist_Eps"
+
+    mu_cond, sig_cond, ordered_imts, site_rup_ctxs, sorted_weights, eps = \
+        _conditional_im_distributions(
+            disagg_type, disagg_dst, imtl, gmm_map, selection_imts, 
+            conditioning_imt, corr_model_map, ctx_builder, occurence,
+            n_samples=None, rng=None)
+
+    df_stats, pdfs, cdfs = distribution_stats(
+        ordered_imts, mu_cond, sig_cond, sorted_weights, percentiles, n_pts)
+
+    return df_stats, pdfs, cdfs 
+
+
+def gcim_simulation(n_samples: int,
+                    disagg_dst: pd.DataFrame,
+                    imtl: float,
+                    gmm_map: GmmMap, 
+                    selection_imts: list[IMT],
+                    conditioning_imt: IMT, 
+                    corr_model_map: CorrMap,
+                    ctx_builder: SiteRupContextBuilder,
+                    occurence: bool,
+                    rup_rng: np.random.Generator,
+                    sim_rng: np.random.Generator):
+    # Disagg data must have columns "TRT", "Mag", "Dist"
+    # Only a full disaggregation including TRT is implemented and the results
+    disagg_type = "TRT_Mag_Dist_Eps"
+
+    mu_cond, sig_cond, ordered_imts, site_rup_ctxs, sorted_weights, eps = \
+        _conditional_im_distributions(
+            disagg_type, disagg_dst, imtl, gmm_map, selection_imts, 
+            conditioning_imt, corr_model_map, ctx_builder, occurence,
+            n_samples=n_samples, rng=rup_rng)
+
+    # loop through the columns (each column is one simulation)
+    sims = generate_simulations(
+        n_samples, mu_cond, sig_cond, ordered_imts, conditioning_imt, 
+        site_rup_ctxs, corr_model_map, sim_rng)
+
+    return sims, mu_cond, sig_cond, site_rup_ctxs, eps 
+
+
+def generate_simulations(
+        n_samples, mu_cond, sig_cond, imts, conditioning_imt, site_rup_ctxs, 
+        corr_model_map, rng):
+    # loop through the columns (each column is one simulation)
+    sims = []
+    for ii in range(mu_cond.shape[1]): # loop through the columns
+        trt = site_rup_ctxs[ii].trt
+        corr_df = corr_model_map[trt]
+        corr_df = _sort_corr_df(
+            corr_df, conditioning_imt.string, [imt.string for imt in imts])
+
+        cond_rho_mat = conditional_correlation_matrix(
+            corr_df, conditioning_imt.string)
+        sims.append(generate_simulation(
+            mu_cond[:, ii], sig_cond[:, ii], cond_rho_mat, rng))
+
+    sims = pd.DataFrame(np.hstack(sims), 
+                        index=[imt.string for imt in imts],
+                        columns=list(range(n_samples)))
+    return sims 
+
+
+def generate_simulation(mu_cond, sig_cond, cond_rho_mat, 
+                        rng:np.random.Generator):
+    # mu_cond and sig_cond are vectors
+    # rho_mat the conditional correlation matrices that correspond to 
+    # mu_cond and sig_cond
     
-    def __init__(self, imt: IMT, gmm: GMPE, ctx: np.recarray, 
-                 conditioning_imt: IMT|None,
-                 conditioning_eps: float, rho: float) -> None:
-        """_summary_
+    mu_cond = mu_cond.reshape((-1, 1))                      # shape (M,1)
+    sig_cond = sig_cond.reshape((-1, 1))                    # shape (M,1)
+    u = rng.standard_normal(len(mu_cond)).reshape(-1, 1)    # shape (M,1)
+    L = np.linalg.cholesky(cond_rho_mat)                    # shape (M,M)
+    v = L @ u
 
-        Args:
-            imt (IMT): _description_
-            gmm (GMPE): _description_
-            ctx (np.recarray): _description_
-            corr_model (CorrelationModel): _description_
+    # create a simulation of the the imt values for this M-R-TRT sample
+    sim = np.exp(mu_cond + sig_cond * v)
+    return sim
 
-        Returns:
-            _type_: _description_
-        """
-        self.imt = imt
-        self.gmm = gmm
-        self.ctx = ctx
-        self.conditioning_imt = conditioning_imt
-        self.conditioning_eps = conditioning_eps
-        self.rho = rho
-        self.uncond = self._unconditional_distribution()
 
-        # conditioning values are provided
-        if (conditioning_eps is not None) and (rho is not None):
-            self.cond = self._conditional_distribution(conditioning_eps, rho)
-        
-        # insufficient condtioning values are provided
-        elif (conditioning_eps is None) is not (rho is None):
-            raise ValueError("conditioning_eps and rho must both "
-                             "be None, or both have values")
-        else:
-            self.cond = None
+def _sort_corr_df(corr_df, conditioning_imt: str, imts: list[str]):
+    im_order = imts + [conditioning_imt]
+    corr_df = corr_df.loc[im_order, im_order]
+    return corr_df
 
-        return None
 
-    def _conditional_distribution(self, conditioning_eps:float, rho_ij: float
-            ) -> NormalRV:
-        
-        mean, sigma = self.compute_gmm()
-        conditional_mean = mean + rho_ij * conditioning_eps * sigma
-        conditional_sigma = sigma * np.sqrt(1 - rho_ij**2)
-        rv = stats.norm(loc=conditional_mean, scale=conditional_sigma)
-        return rv
+def _get_weights(disagg_dst, occurence):
+    if occurence: # weights are from P(m|X=x) occurence probability
+        weights = disagg_dst["P(m|X=x)"].to_numpy()
+    else: # weights are from P(m|X>x) exceedance probability
+        weights = disagg_dst["P(m|X>x)"].to_numpy()
+    return weights
 
-    def _unconditional_distribution(self) -> NormalRV:
-        # just return the gmm result 
-        mean, sigma = self.compute_gmm()
-        rv = stats.norm(loc=mean, scale=sigma)
-        return rv
 
-    def compute_gmm(self) -> tuple[float, float]:
-        # Compute mean and standard deviation using gmm and ctx
-        N = len(self.ctx[self.ctx.dtype.names[0]]) # sites or rups in ctx
-        M = 1  # only this class only handles one IMT at a time
-        
-        mean = np.zeros((M, N))
-        sigma = np.zeros((M, N))
-        tau = np.zeros((M, N))
-        phi = np.zeros((M, N))
+def _sort_ctxs_weights_by_trt(site_rup_ctxs, weights):
+    trts = np.unique(site_rup_ctxs.trt)
+    ctx_trt_subsets = {}
+    weights_trt_subsets = {}
+    for trt in trts:
+        # Filter context for this specific TRT
+        trt_mask = site_rup_ctxs.trt == trt
+        ctx_trt_subsets[trt] = site_rup_ctxs[trt_mask]
+        weights_trt_subsets[trt] = weights[trt_mask]
 
-        self.gmm.compute(self.ctx, [self.imt], mean, sigma, tau, phi)
-        return mean.flatten()[0], sigma.flatten()[0]
+    sorted_weights = np.concatenate([w for w in weights_trt_subsets.values()])
+    return ctx_trt_subsets, sorted_weights
+
+
+def _group_imts(selection_imts):
+    groups = dict.fromkeys([imt.name for imt in selection_imts])
+    for k in groups.keys():
+        groups[k] = [imt for imt in selection_imts if imt.name == k]
+    return groups
+
+
+def _calculate_eps_by_trt(ctx_trt_subsets, gmm_map, conditioning_imt, imtl):
+    # calculate the conditioning epsilon for all ctxs
+    epss = {}
+    for trt, ctxs in ctx_trt_subsets.items():
+        # calculate conditioning epsilon values
+        gmm_im_cond = gmm_map[trt][conditioning_imt.name]
+        m, s, *_ = _compute_gmm(gmm_im_cond, ctxs, [conditioning_imt])
+        eps = (np.log(imtl) - m) / s
+        epss[trt] = eps
+    return epss
+
+
+def conditional_im_distributions(
+        site_rup_ctx: np.recarray,
+        gmm: GMPE,
+        imts: IMT|list[IMT],
+        rhos: list[float]|np.ndarray,
+        eps: list[float]|np.ndarray
+        ) -> tuple[float, float, float, float]:
     
-    def cdf(self, eps: float, cond: bool, npts:int=50) -> NDArray:
-        # returns either the conditional or unconditional cdf between X values
-        # corresponding to mu - eps*sigma and mu + eps* sigma
+    # ctx  : recarray of length N
+    # imts : list of length M
+    # rho  : list of length N
+    # eps  : list of length M
 
-        if cond: rv = self.cond 
-        else: rv = self.uncond
+    rhos = np.array(rhos)[:, np.newaxis]  # shape (M, 1)
+    eps = np.array(eps)[np.newaxis, :]    # shape (1, N)
 
-        x1 = rv.mean() - eps * rv.std()
-        x2 = rv.mean() + eps * rv.std()
-        xs = np.linspace(x1, x2, npts)
+    if isinstance(imts, IMT):
+        imts = [imts]
 
-        return np.vstack([xs, rv.cdf(xs)]).T
-
-
-    def __repr__(self) -> str:
-        return f"TargetDistribution(imt={self.imt}, gmm={self.gmm}, " \
-               f"gmm={self.ctx}, conditioning_imt={self.conditioning_imt}, "\
-               f"conditioning_eps={self.conditioning_eps}, rho={self.rho})"
-
-
-class CorrelationModel:
-    """
-    correlation model classes - used to construct a covariance matrix
-    for an arbitrary number of ims as pandas data frame.
+    mu, sig, *_ = _compute_gmm(gmm, site_rup_ctx, imts)
+    mu_cond = mu + sig * rhos * eps
+    sig_cond = sig * np.sqrt(1 - rhos ** 2)
     
-    Acts as a wrapper for the pandas data frame correlation matrix.
+    return mu, sig, mu_cond, sig_cond
+
+
+def _conditional_im_distributions(
+        disagg_type: str,
+        disagg_dst: pd.DataFrame,
+        imtl: float,
+        gmm_map: GmmMap, 
+        selection_imts: list[IMT],
+        conditioning_imt: IMT, 
+        corr_model_map: CorrMap,
+        ctx_builder: SiteRupContextBuilder,
+        occurence: bool, 
+        n_samples: float|None=None,
+        rng: np.random.Generator|None=None):
+    """ 
+    Get the mu_cond and sig_cond for the selection_imts conditional on
+    conditioning_imt and the imtl for n_samples from the disagg_dist.
     """
-    def __init__(self, model: str|None=None, tag:str="", 
-                 only_imts:list[IMT]=[],
-                 exclude_imts:list[IMT]=[], 
-                 exclude_SA_T_gt: IMT|None=None,
-                 exclude_SA_T_lt: IMT|None=None) -> None:
-        # load the correlation model from data folder
-        if model is not None:
-            self.corr = load_correlation_model(
-                model, only_imts, exclude_imts, 
-                exclude_SA_T_gt, exclude_SA_T_lt)
-        else:
-            self.model = model
-            self.corr = pd.DataFrame()
-        
-        if (model is not None) and tag == "":
-            self.tag = model
-        else:   
-            self.tag = tag
+    # the disaggregation on epsilon doesn't affect the calculations so we can
+    # collapse these rows to get the actual rupture scenarios.
+    ddst = disagg_dst.groupby(["TRT", "Mag", "Dist"]).sum().reset_index()
 
-    @property
-    def correlations(self):
-        return self.corr
+    # filter out all the options that have a probability of zero as they
+    # will contribute nothing to the gcim or samples and just add calculation time otherwise
+    mask = ddst["P(m|X=x)"] != 0
+    ddst = ddst.loc[mask, :]
 
-    def get_correlation(self, im1: IMT, conditioning_im: IMT) -> float:
-        """
-        Get the correlation value for two imts.
-        """
-        # check if the IM exists in the correlation model
-        if str(im1) not in self.corr.columns:
-            if not str(im1).startswith("SA"):
-                # raise error
-                raise ValueError(f"IM {im1} not found in correlation model" 
-                                 f"{self.model}")
-            else:
-                # try to interpolate column for the missing SA(im1)
-                T1 = im1.period
-                # Series indexed by rows (conditioning IMs)
-                im_series = interpolate_for_sa(self.corr, T1)  
+    weights = _get_weights(ddst, occurence)
 
-                # If the conditioning IM exists in the index, return directly
-                if str(conditioning_im) in im_series.index:
-                    return float(im_series.at[str(conditioning_im)])
+    # create the rupture contexts
+    if n_samples is not None:
+        rup_samples = ddst.sample(
+        n=n_samples, replace=True, random_state=rng, weights=weights)
+        # reassign weights so it has length n_samples
+        weights = _get_weights(rup_samples, occurence)
+    else:
+        rup_samples = ddst
+    site_rup_ctxs = get_site_rup_ctxs(disagg_type, rup_samples, ctx_builder)
 
-                # If the conditioning IM is an SA and is not present in the 
-                # rows, interpolate along the rows
-                if str(conditioning_im).startswith("SA"):
-                    T2 = conditioning_im.period
-                    sa_pattern = re.compile(r"SA\(([\d.]+)s\)")
+    # sort ctxs and weights by trt
+    ctx_trt_subsets, sorted_weights = _sort_ctxs_weights_by_trt(site_rup_ctxs, weights)
 
-                    # Extract available SA rows (period, value) from the 
-                    # interpolated column
-                    sa_items = {}
-                    for idx, val in im_series.items():
-                        m = sa_pattern.match(idx)
-                        if m:
-                            sa_items[float(m.group(1))] = float(val)
+    # sort imts by imt.name
+    imt_groups = _group_imts(selection_imts)
 
-                    if not sa_items:
-                        raise ValueError(f"No SA rows available to interpolate " 
-                                         f"conditioning IM {conditioning_im}")
+    # calculate the conditioning parameters first
+    epss = _calculate_eps_by_trt(ctx_trt_subsets, gmm_map, conditioning_imt, imtl)
+    
+    # calculate the im distributions    
+    mu_cond = []
+    sig_cond = []
+    for im_name, imts in imt_groups.items():
+        mu_conds_for_im = [] 
+        sig_conds_for_im = []
 
-                    # Sort by period and interpolate to T2
-                    sa_items.sort(key=lambda x: x[0])
-                    periods = np.array([p for p, _ in sa_items])
-                    values = np.array([v for _, v in sa_items])
-
-                    interp_val = np.interp(
-                        T2, periods, values, left=np.nan, right=np.nan)
-                    if np.isnan(interp_val):
-                        raise ValueError(f"Could not interpolate correlation " 
-                                         f"for {conditioning_im} vs {im1}")
-                    return float(interp_val)
-
-                # conditioning_im not there and not in SA -> cannot interpolate
-                raise ValueError(f"Conditioning IM {conditioning_im} not "
-                                 f"found in correlation model {self.model}")
+        for (trt, ctxs), eps in zip(ctx_trt_subsets.items(), epss.values()):
+            # get rhos vector
+            rhos = corr_model_map[trt].loc[conditioning_imt.string, 
+                                           [imt.string for imt in imts]].to_numpy()
             
-        corr_value = self.corr.at[str(conditioning_im), str(im1)]
-        return corr_value
+            # get appropriate gmm for im_name and trt
+            gmm = gmm_map[trt][im_name]
 
-    def get_SA_periods(self) -> list[float]:
-        """
-        Get the available spectral acceleration periods in the correlation 
-        model.
-        """
-        sa_periods = []
-        for imt_str in self.corr.columns:
-            period = period_from_SA_IMT_str(imt_str)
-            if period:
-                sa_periods.append(period)
-        return sa_periods
+            # calculate the conditional distributions
+            _, _, mc, sc = conditional_im_distributions(
+                ctxs, gmm, imts, rhos, eps.flatten())
+
+            # append the results of the conditional distributions (hstack)
+            mu_conds_for_im.append(mc)
+            sig_conds_for_im.append(sc)
+
+        mu_cond.append(np.hstack(mu_conds_for_im))
+        sig_cond.append(np.hstack(sig_conds_for_im))
+    mu_cond = np.vstack(mu_cond)
+    sig_cond = np.vstack(sig_cond)
     
-    def add_correlations_to_model(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Add rows and columns to the correlation corr dataframe.
-        The DataFrame should have columns corresponding to the IMs in the 
-        correlation model.
-        """
-        ... # todo:: be implemented
-
-    def __repr__(self):
-        return f"CorrelationModel(model={self.model})"
-
-    def __str__(self):
-        return f"{self.model}"
+    ordered_imts = [imt for sublist in imt_groups.values() for imt in sublist] 
+    ordered_ctxs = np.concatenate([ctx for ctx in ctx_trt_subsets.values()]).view(np.recarray)
+    ordered_eps = [eps for sublist in epss.values() for eps in sublist]
+    return mu_cond, sig_cond, ordered_imts, ordered_ctxs, sorted_weights, ordered_eps
 
 
-def period_from_SA_IMT_str(imt_str: str):
-    sa_pattern = re.compile(r"SA\(([\d.]+)\)")
-    m = sa_pattern.match(imt_str)
-    if m:
-        return float(m.group(1))
+def _compute_gmm(gmm, ctx, imts):
+    mean = np.zeros((len(imts), len(ctx)))
+    sig = np.zeros_like(mean)
+    tau = np.zeros_like(mean)
+    phi = np.zeros_like(mean)
+    gmm.compute(ctx, imts, mean, sig, tau, phi)
+    return mean, sig, tau, phi
+
+
+def _distribution_mean(mu_cond, sig_cond, weights, axis):
+    # expectation of a mixed distribution of log normal random variables
+    mean_val = np.sum(weights * np.exp(mu_cond + 0.5*sig_cond**2), axis=axis)
+    mean_val = mean_val.reshape((mu_cond.shape[0], -1))
+    return mean_val
+
+
+def _distribution_percentiles(percentiles, mu_cond, sig_cond, 
+                             weights, im_low, im_high):
+    # mu_cond: (M, N) matrix
+    # im_low/im_high: (M,) vectors for each IMT
+    M = mu_cond.shape[0]
+    num_p = len(percentiles)
+    results = np.zeros((M, num_p))
+
+    for i in range(M):
+        # Define the mixture CDF for the i-th IMT only
+        # target_x is a scalar passed by the solver
+        def mixture_cdf(target_x):
+            # cdfs is shape (N,)
+            cdfs = stats.lognorm.cdf(target_x, s=sig_cond[i, :], 
+                                     scale=np.exp(mu_cond[i, :]))
+            # Return scalar weighted sum (Equation 8)
+            return np.sum(weights * cdfs)
+
+        # Solve for each requested percentile
+        for j, p in enumerate(percentiles):
+            results[i, j] = brentq(lambda x: mixture_cdf(x) - p, 
+                                   im_low[i], im_high[i])
+    return results
     
 
-def load_correlation_model(correlation_model: str, 
-                           only_imts: list[IMT]=[],
-                           exclude_imts: list[IMT]=[], 
-                           exclude_SA_T_gt: IMT|None=None,
-                           exclude_SA_T_lt: IMT|None=None) -> pd.DataFrame:
-    with res.files("pickagm.data").joinpath(f"{correlation_model}.csv") \
-        .open("r", encoding="utf-8") as f:
-        df = pd.read_csv(f, sep=",", index_col=[0], header=[0])
-
-    if only_imts != []:
-        imt_names = [str(imt) for imt in only_imts]
-        df = df.loc[imt_names, imt_names] 
-
-    if exclude_imts != []:
-        imt_names = [str(imt) for imt in exclude_imts]
-        df = df.drop(index=imt_names, columns=imt_names)
-
-    if exclude_SA_T_gt is not None:
-        imt_names = [imt for imt in df.columns 
-                     if imt.startswith("SA") and 
-                     (period_from_SA_IMT_str(imt) > 
-                      period_from_SA_IMT_str(str(exclude_SA_T_gt))) 
-                     ]
-        df = df.drop(index=imt_names, columns=imt_names)
-
-    if exclude_SA_T_lt is not None:
-        imt_names = [imt for imt in df.columns 
-                     if imt.startswith("SA") and 
-                     (period_from_SA_IMT_str(imt) < 
-                      period_from_SA_IMT_str(str(exclude_SA_T_lt))) 
-                     ]
-        df = df.drop(index=imt_names, columns=imt_names)
-
-    return df
-
-
-def correlation_matrix(
-        list_of_imts: list[IMT], correlation_model: CorrelationModel,
-        conditioning_imt: IMT|None=None, incl_conditioning_imt: bool=False
-        ) -> pd.DataFrame|tuple[pd.DataFrame, pd.Series]:
+def distribution_stats(imts, mu_cond, sig_cond, weights, percentiles, n_pts):
+    # calculate the stats of the im distributions
+    pdfs = {}
+    cdfs = {}
+    mean_vals = []
+    percentile_vals = []
     
-    """returns the correlation matrix of the chosen IMs depending on the
-    correlation model. Periods of SA(T) are interpolated if they don't exist in
-    the model already.
+        # determine the pdf bounds and evaluate pdfs and cdfs
+    im_low = np.exp(np.min(mu_cond - 3 * sig_cond, axis=1))  #(M,)
+    im_high = np.exp(np.max(mu_cond + 3 * sig_cond, axis=1))
+    # Create an (M, n_pts) matrix of x-values
+    x_vals = np.array([np.geomspace(il, ih, n_pts) for il, ih in zip(im_low, im_high)])
 
-    Error will be raised if a non-SA imt is in list_of_imts but not in
-    correlation_model
+    # mu/sig: (M, N) -> (M, N, 1)
+    # x_vals: (M, n_pts,) -> (M, 1, n_pts)
+    mu_3d = mu_cond[:, :, np.newaxis]
+    sig_3d = sig_cond[:, :, np.newaxis]
+    x_3d = x_vals[:, np.newaxis, :]
 
-    If conditioning_imt != None then an additional vector is returned which is 
-    a  (N,1) array of the correlations between each of the N dependent imts and 
-    the conditioning imt. 
-    
-    If ncl_conditioning_imt is False and conditioning_imt is already in 
-    list_of_imts the the correlation vector is removed from the correlation 
-    matrix.
+    # 3. Calculate 3D PDF Matrix
+    # Resulting shape: (M, N, 500)
+    pdf_matrix = stats.lognorm.pdf(x_3d, s=sig_3d, scale=np.exp(mu_3d))
+    cdf_matrix = stats.lognorm.cdf(x_3d, s=sig_3d, scale=np.exp(mu_3d))
 
-    if 
+    # 4. Sum together weighted by rupture probabilities (Eq. 8)
+    # weights (N,) broadcast to (1, N, 1)
+    # Final shape: (M, n_pts) - One PDF/CDF with n_pts per IMT
+    total_pdfs = np.sum(pdf_matrix * weights[np.newaxis, :, np.newaxis], axis=1)
+    total_cdfs = np.sum(cdf_matrix * weights[np.newaxis, :, np.newaxis], axis=1)
+    for imt, pdf, cdf, xs in zip(imts, total_pdfs, total_cdfs, x_vals):
+        pdfs[imt.string] = np.hstack([xs.reshape(-1, 1), 
+                                      pdf.reshape(-1, 1)])
+        cdfs[imt.string] = np.hstack([xs.reshape(-1, 1), 
+                                      cdf.reshape(-1, 1)])
+            
+    # calculate point stats
+    mean_vals = _distribution_mean(mu_cond, sig_cond, weights, axis=1)
+    percentile_vals = _distribution_percentiles(
+        percentiles, mu_cond, sig_cond, weights, im_low, im_high)
 
-    Returns:
-        _type_: _description_
-    """
-    
-    if conditioning_imt and (not conditioning_imt in list_of_imts):
-        imts_to_check = list_of_imts + [conditioning_imt]
-    else:
-        imts_to_check = list_of_imts
+    # organise the outputs:
+    # vstack all of the results
+    all_stats = np.hstack([mean_vals, percentile_vals])
 
-    SA_imts_not_in_model = [imt for imt in imts_to_check
-                            if str(imt) not in \
-                            correlation_model.correlations.index and 
-                            str(imt).startswith("SA")]
+    stats_labels = ["mean"] + [f"p{int(p*100)}" for p in percentiles]
 
-    imt_correlations = correlation_model.correlations.copy()
+    df_stats = pd.DataFrame(all_stats, 
+                            index=[im.string for im in imts],
+                            columns=stats_labels)
 
-    # interpolate new SA ims if needed and add to dataframe
-    SA_imts_not_in_model = [imt for imt in SA_imts_not_in_model 
-                            if str(imt).startswith("SA")]
-    for imt in SA_imts_not_in_model:
-        interp_values = interpolate_for_sa(
-            correlation_model.correlations, period_from_SA_IMT_str(str(imt))
-        )
+    return df_stats, pdfs, cdfs 
+
+
+def ensemble_ks_test(record_ensemble_im_df: pd.DataFrame, target_cdfs: dict,
+                     p_val=0.05):
+
+    # get the ecdf of selected records for each im:   
+    im_df = record_ensemble_im_df
+    kst_results = {}
+
+    for im, values in im_df.T.iterrows():
+        # 2 sample ks-test with null hypothesis that the distributions are drawn
+        # from teh same parent distribution
+
+        if im not in target_cdfs.keys():
+            # key error woulde raised for the conditioning im because it has no
+            # target cdf. Therefore it is skipped.
+            continue
         
-        # add the column/row for this imt to the end. correlation is 1 with
-        # self is 1
-        imt_correlations[str(imt)] = interp_values
-        imt_correlations.loc[str(imt), :] = interp_values.tolist() + [1.0]
+        def cdf(x):
+            xp = target_cdfs[im][:,0]
+            fp = target_cdfs[im][:,1]
+            return np.interp(x, xp, fp, left=0, right=1)
 
-    keys = [str(imt) for imt in imts_to_check]
-    corr_matrix = imt_correlations.loc[keys, keys]
+        kst_results[im] = stats.ks_1samp(values.to_numpy(), cdf)
 
-    if conditioning_imt:
-        if str(conditioning_imt) in imt_correlations.columns:
-            corr_vector = corr_matrix[str(conditioning_imt)] 
+    # check if all ims pass
+    failed_ims = []
+    for im, kst, in kst_results.items():
+        # if the statistic is less than p_val we must reject the null hypothesis
+        # and say that the distributions are statisitcally different
+        if kst.pvalue < p_val or np.isnan(kst.pvalue):
+            failed_ims.append(im) 
 
-            if not incl_conditioning_imt:
-                corr_matrix = corr_matrix.drop(index=str(conditioning_imt))
-                corr_matrix = corr_matrix.drop(columns=str(conditioning_imt))
-                corr_vector = corr_vector.drop(labels=str(conditioning_imt))
+    passed = False if len(failed_ims) > 0 else True
+    return passed, kst_results, failed_ims
 
-            return corr_matrix, corr_vector
-        else:
-            raise KeyError(f"imt {conditioning_imt} not in correlation matrix")
+
+def ensemble_ecdfs(record_ensemble_ims_df: pd.DataFrame):
+    im_df = record_ensemble_ims_df
+    ecdfs = {}
+    for im, values in im_df.T.iterrows():
+        ecdf = stats.ecdf(values.to_numpy()).cdf
+
+        x_vals = np.repeat(ecdf.quantiles, 2)
+        y_vals = np.repeat(ecdf.probabilities, 2)
+        y_vals = np.concatenate(([0], y_vals[:-1]))
+
+        ecdfs[im] = np.column_stack([x_vals, y_vals])
+    return ecdfs
+
+
+def ensemble_ks_bounds(target_cdfs: dict, n_sims: int, p_val:float=0.05) -> dict:
+    # get upper and lower bounds for the specified p-val
+    n_a = n_sims # number of samples in the sample distribution
+
+    ks_bounds = {}
+    for k, cdf in target_cdfs.items():
+        x_vals = np.append([0], cdf[:, 0]).reshape((-1, 1))
+        y_vals = np.append([0], cdf[:, 1]).reshape((-1, 1))
+        n_b = len(cdf)  #  number of samples in the parent distribution (CDF) 
+        n_eff = np.round((n_a * n_b) / (n_a + n_b))
+
+        # kstwo.ppf is the inverse of the cdf of the two-sided Smirnov distribution.
+        # By using we 1-p_val we are finding the value of D that is exceeded only
+        # p-val of the time by random chance. i.e. "I think a p_val fluke is rare and
+        # bet that the hypothesis that they are the same is wrong" 
+        D_pval = stats.kstwo.ppf(1-p_val, n_eff)
+        upper = np.clip(y_vals + D_pval, 0, 1).reshape((-1, 1))
+        lower = np.clip(y_vals - D_pval, 0, 1).reshape((-1, 1))
+
+        ks_bounds[k] = np.hstack([x_vals, lower, y_vals, upper])
+
+    # dictionary: values = np.ndarray with columns for x_vals, lower_ks_bournd, 
+    # cdf, upper_ks_bound
+    return ks_bounds
+
     
-    return corr_matrix
-
-
-def unconditional_covariance_matrix(
-        imt_distributions: list[IMDistribution],
-        correlation_matrix: pd.DataFrame) -> pd.DataFrame:
-    
-    sig_vec = np.array(
-        [imtd.uncond.std() for imtd in imt_distributions]
-        ).reshape(-1,1)
-    sig_mat = np.matmul(sig_vec, sig_vec.T)
-
-    labels = correlation_matrix.index
-    cm = correlation_matrix.to_numpy()
-    return pd.DataFrame( cm * sig_mat, index=labels, columns=labels) 
-
-
-def covariance_vector(
-        imt_distributions: list[IMDistribution],
-        conditioning_imt_distribution: IMDistribution,
-        conditioning_imt_correlation_vector: pd.Series, 
-        ) -> pd.Series:
-    
-    sigmas = np.array([imtd.uncond.std() for imtd in imt_distributions]).flatten()
-    Sigma_One = conditioning_imt_correlation_vector.to_numpy() * \
-        sigmas * conditioning_imt_distribution.uncond.std()
-    labels = conditioning_imt_correlation_vector.index
-    return pd.Series(Sigma_One, index=labels)
-
-
-def conditional_mean_vector(
-        imt_distributions: list[IMDistribution]) -> pd.Series:
-    labels = [str(imtd.imt) for imtd in imt_distributions]
-    mean_values = []
-    for imtd in imt_distributions:
-        mv = imtd.cond.mean()
-        if not np.isfinite(mv): 
-            # catches the case where the contioninal IM has sigma == 0 and 
-            # the rv can't calculate the mean and instead returns nan
-            mv = imtd.cond.kwds["loc"]
-        mean_values.append(mv)
-    
-    return pd.Series(mean_values, index=labels)
-
-
-def conditional_sigma_vector(
-        imt_distributions: list[IMDistribution]) -> pd.Series:
-    labels = [str(imtd.imt) for imtd in imt_distributions]
-    sigma_values = []
-    for imtd in imt_distributions:
-        sv = imtd.cond.std()
-        if not np.isfinite(sv): 
-            # catches the case where the contioninal IM has sigma == 0 and 
-            # the rv can't calculate the std and instead returns nan
-            sv = imtd.cond.kwds["scale"]
-        sigma_values.append(sv)
-    return pd.Series(sigma_values, index=labels)
-
-
-def conditional_covariance_matrix(
-        Sigma_0: pd.DataFrame, Sigma_1: pd.Series,
-        conditioning_imt_distribution: IMDistribution) -> pd.DataFrame:
-    
-    labels = Sigma_0.index
-    sigma_star = conditioning_imt_distribution.uncond.std()
-    Sigma_1 = Sigma_1.to_numpy().reshape(-1,1)
-    Sigma = Sigma_0.to_numpy() - (1 /  sigma_star ** 2) * \
-          np.matmul(Sigma_1, Sigma_1.T)
-    res = pd.DataFrame(Sigma, index=labels, columns=labels)
-    return res
-
-
-def create_im_distributions(
-        imts: list[IMT], correlation_model: CorrelationModel,
-        gmm_mapping: dict[str, GMPE], ctx: np.recarray, 
-        conditioning_imt: IMT, conditioning_eps: float
-        ) -> tuple[IMDistribution, list[IMDistribution]]:
-    
-    """
-    create the im distributions used for record selection.
-
-    imts: dependent IMTs
-
-    Assumes:
-    -   all imts are in the correlation model or can be interpolated from values
-        that are in there
-
-    """
-       
-    im_dists = []
-    for imt in imts:
-        if str(imt).startswith("SA"):
-            key = "SA"
-        else:
-            key = str(imt)
-
-        rho = correlation_model.get_correlation(imt, conditioning_imt)
-
-        im_dists.append(IMDistribution(
-            imt, gmm_mapping[key], ctx, conditioning_imt, conditioning_eps, rho 
-        ))
-
-    # distribution for the conditioning imt
-    if str(conditioning_imt).startswith("SA"):
-        key = "SA"
-    else:
-        key = str(conditioning_imt)
-
-    imd_star = (IMDistribution(
-        conditioning_imt, gmm_mapping[key], ctx, 
-        conditioning_imt, conditioning_eps, 1.0 
-        ))
-
-    return imd_star, im_dists
-
-
-def get_cs(imt_distributions: list[IMDistribution], 
-           conditioning_imt_distribution: IMDistribution) -> NDArray:
-    
-    cond_imt_dist = conditioning_imt_distribution
-    # filter out the imts that are SA
-    if str(conditioning_imt_distribution.imt).startswith("SA"):
-        sa_imtds = [imtd for imtd in imt_distributions + [cond_imt_dist]
-                     if str(imtd.imt).startswith("SA")]
-    else:
-        sa_imtds = [imtd for imtd in imt_distributions
-                     if str(imtd.imt).startswith("SA")]
-        
-    periods = [imtd.imt.period for imtd in sa_imtds]
-    mus = [imtd.cond.mean() for imtd in sa_imtds]
-    sigmas = [imtd.cond.std() for imtd in sa_imtds]
-
-    points = [(p,m,s) for p, m, s in zip(periods, mus, sigmas)]
-    sorted_points = sorted(points, key=lambda x: x[0])
-
-    return np.array(sorted_points)
-
-
-def sample_im_distribution(
-        mean_vec: pd.Series, covariance_matrix: pd.DataFrame, n: int=1,
-        seed: int|None=None
-        ) -> pd.DataFrame:
-    """ use 'svd' method so that the semi-definite problem can be solved
-    the return samples are in the form ln(IM). To get the true im value they
-    need to be exponentiated IM = exp(ln(IM))
-
-    Args:
-        mean_vec (pd.Series): _description_
-        covariance_matrix (pd.DataFrame): _description_
-        n (int, optional): _description_. Defaults to 1.
-
-    Returns:
-        pd.DataFrame: _description_
-    """
-    labels = mean_vec.index
-    rng = np.random.default_rng(seed)
-    realisation = rng.multivariate_normal(
-        mean_vec.to_numpy(), covariance_matrix.to_numpy(), 
-        size=n, method="svd")
-
-    columns = [f"s{ii+1}" for ii in range(0,n)]
-
-    return pd.DataFrame(realisation.T, index=labels, columns=columns).T
-
-
-def get_empirical_cdfs(df: pd.DataFrame) -> pd.Series:
-    """_summary_
-
-    Args:
-        df (pd.DataFrame): a Dataframe where each row corresponds to an imt and
-        each column a different simulation / record
-
-    Returns:
-        pd.Series: a series where each cell is scipy.stats.ecdf object
-    """
-    # Apply ECDF row-wise
-    return df.apply(lambda row: stats.ecdf(row.to_numpy()), axis=1)
-
-# todo:: create a correlation matrix for the BJ08 model
+def ensemble_r_score(ks_results: dict, weights: np.ndarray):
+    # score of the misfit of the total ensemble, following Bradley (2012) 
+    score = np.array([wi * ks.statistic ** 2 
+                      for ks, wi in zip(ks_results.values(), weights)]).sum()
+    return score

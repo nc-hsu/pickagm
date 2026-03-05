@@ -5,46 +5,271 @@
 import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
-from typing import Callable
+from typing import Callable, Protocol
 
 from openquake.hazardlib.imt import IMT
+from openquake.hazardlib.gsim.base import GMPE
 
-from pickagm.distributions import SCALING_EXPONENTS
-
-def sse_multi(
-        eqdf: pd.DataFrame, im_sims: np.ndarray | pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute (sum(ln(eqdb) - ln(im_sim))**2).sum(axis=1) for multiple im_sim 
-    realizations.
-    
-    Parameters
-    ----------
-    eqdf : pd.DataFrame
-        Data matrix (n_record x n_ims)
-    im_sims : np.ndarray or pd.DataFrame
-        Realizations matrix (n_realizations x n_ims)
-    
-    Returns
-    -------
-    pd.DataFrame
-        Result of shape (n_rows, n_realizations)
-    """
-    df_array = np.log(eqdf.to_numpy())                 # (n_records, n_ims)
-    vecs = np.log(np.asarray(im_sims))                 # (n_realizations, n_ims)
-    
-    # Compute all differences: 
-    # broadcast df_log[:, None, :] against vecs_log[None, :, :]
-    # resulting shape (n_records, n_realizations, n_ims)
-    diff = df_array[:, None, :] - vecs[None, :, :]   
-    
-    # Square and sum over columns
-    result = np.sum(diff ** 2, axis=2) # (n_records, n_realizations)                
-    
-    # Wrap back into DataFrame for nice labeling
-    return pd.DataFrame(result, index=eqdf.index, columns=im_sims.index)
+from pickagm.distributions import (
+    SCALING_EXPONENTS, ensemble_ks_test, ensemble_r_score)
+from pickagm.corrmodels import conditional_correlation_matrix
+from pickagm.typing import GmmMap, CorrMap, IMTName
+from pickagm.contexts import SiteRupContextBuilder, get_rup_ctxs
 
 
-def scale_records_in_db(
+def _filter_on_bounds(df, col, bounds):
+    lb, ub = bounds
+    if lb and ub:
+        df = df[(df[col] >= lb) & (df[col] <= ub)]
+    elif lb:
+        df = df[df[col] >= lb]
+    elif ub:
+        df = df[df[col] <= ub]
+    return df
+
+
+def preselection(df, magnitude_bounds, distance_bounds, vs30_bounds, usable_T):
+    # preselection filtering
+
+    if magnitude_bounds is not None:
+        df = _filter_on_bounds(df, ("metadata", "mag"), magnitude_bounds)
+
+    if distance_bounds is not None:
+        df = _filter_on_bounds(df, ("metadata", "rjb"), distance_bounds)
+
+    if vs30_bounds is not None:
+        df = _filter_on_bounds(df, ("metadata", "vs30"), vs30_bounds)
+
+    if usable_T is not None:
+        df = df[df[("metadata", "max_usable_T")] >= usable_T]
+
+    return df
+
+
+def filter_on_sf(df, sf_bounds: tuple[float, float]|None):
+    if sf_bounds is not None:
+        df = _filter_on_bounds(df, ('metadata', 'alpha'), sf_bounds)
+    return df
+
+
+def pick_records(df: pd.DataFrame, 
+                 scores: np.ndarray,
+                 max_count: int,
+                 sim_trts: list[str]|None,
+                 ok_trt_matches: dict[str, list[str]]|None):
+    
+    """ selects records from df based on the given scores. 
+    Assumed that the lowest score is preferred
+    df must have a a multiindex with level 0 headings of 'metadata' and 
+    'ims_scaled'. """
+    
+    # the number of rows in scores should match the length of df
+    assert scores.shape[0] == df.shape[0]
+    
+    empty_row = pd.Series(np.nan, index=df.columns)
+
+    # loop across the columns and find the best fit records not already selected
+    selected_records = []
+    selected_sses = []
+    for ii, c in enumerate(scores.columns): # loop through each sim
+        if (sim_trts is not None) and (ok_trt_matches is not None):
+            # get the scores only for the same trt type as the sim
+            sim_trt = sim_trts[ii]
+            allowable_trts = ok_trt_matches[sim_trt] 
+            allowable_recs = df[df[("metadata", "trt")].isin(allowable_trts)].index
+        else:
+            # allow scores from all trt types
+            allowable_recs = df.index
+            
+        col = scores.loc[allowable_recs, c].to_numpy()            # trt filtered, unsorted (original order)
+        sorted_col = np.sort(col)     # sorted smallest to largest
+        record_selected = False
+        for v in sorted_col:    
+            # loop through the scores for each record until we find the smallest 
+            # score that hasn't been selected already and is a valid selection
+            idxs = np.where(col == v)[0]
+            for idx in idxs:        # if multiple have the same score take first
+                record = df.loc[allowable_recs[idx], :]
+                if _valid_selection(record, selected_records, max_count):
+                    selected_records.append(record)
+                    record_selected = True
+                    selected_sses.append(v)
+                    break 
+
+            if record_selected: # moves onto the next sim
+                break
+
+        if not record_selected: # no record found
+            selected_records.append(empty_row)
+
+    selected_records = pd.DataFrame(selected_records)
+    return selected_records 
+
+
+def greedy_optimise_for_Rscore(
+        selected_records_im_df: pd.DataFrame, 
+        records: pd.DataFrame, 
+        target_cdfs: dict, 
+        im_weights: np.ndarray,
+        p_value: float,
+        allow_early_break: bool):
+    
+    optimised = False
+    _, initial_ks_results, _ = ensemble_ks_test(selected_records_im_df, target_cdfs, p_value)
+    current_score = ensemble_r_score(initial_ks_results, im_weights)
+
+    og_record_idxs = selected_records_im_df.index.to_list()
+    current_best_records = og_record_idxs.copy()
+    current_record_idxs = og_record_idxs.copy()
+
+    for ii, _ in enumerate(og_record_idxs):
+        for new_idx in records.index.to_list():
+            
+            if new_idx in current_record_idxs:
+                # recorded already selected -> skip
+                continue
+
+            current_record_idxs[ii] = new_idx
+
+            # get the dataframe
+            new_ensemble = records.loc[current_record_idxs, :]
+
+            # do the ks_test
+            ks_pass, new_ks_results, _ = ensemble_ks_test(new_ensemble, target_cdfs, p_value)
+            new_score = ensemble_r_score(new_ks_results, im_weights)
+
+            if new_score >= current_score:
+                # no improvement
+                continue
+            
+            # if here then we have seen an improvement but not. Store and move on
+            optimised = True
+            current_best_records[ii] = new_idx
+            
+            if ks_pass and allow_early_break:
+                # we have all records passing and can break
+                break
+
+        if ks_pass and allow_early_break:
+            break
+
+    # extract the final record set and do a ks_test
+    new_ensemble = records.loc[current_best_records, :]
+    kstest_out = ensemble_ks_test(new_ensemble, target_cdfs, p_value)
+    return new_ensemble, kstest_out, optimised
+
+
+def set_weights(weights, n):
+    """ the weights should have the same length as the number of selection
+    imts """
+    if weights is None:
+        weights = np.ones(n)
+    else:
+        assert len(weights) == n
+        weights = np.array(weights)                             # shape (M,)
+    weights = (weights / weights.sum())                     #  normalise to one
+    return weights
+
+
+def calculate_sse_scores(
+        df: pd.DataFrame, 
+        simulations: pd.DataFrame, 
+        sig_cond: pd.DataFrame,
+        weights: list|np.ndarray|None,
+        conditioning_imt: IMT):
+    """ convenience wrapper for record_sses that takes the whole record df"""
+    scaled_im_df = df["ims_scaled"].drop(columns=conditioning_imt.string)
+    sse = record_sses(scaled_im_df, simulations, sig_cond, weights)
+    return sse 
+
+
+def record_sses(scaled_rec_df: pd.DataFrame, simulation_df: pd.DataFrame, 
+               sig_cond: pd.DataFrame|np.ndarray, weights: np.ndarray
+               ) -> pd.DataFrame:
+    rdf = scaled_rec_df
+    sdf = simulation_df
+
+    recs = np.log(rdf.to_numpy())                              # shape (R,M)
+    sims = np.log(sdf.loc[rdf.columns, :].to_numpy())          # shape (M,N)
+    if isinstance(sig_cond, pd.DataFrame):
+        sigs =  sig_cond.loc[rdf.columns, :].to_numpy()            # shape (M,N)
+    else:
+        sigs = sig_cond
+
+    # broadcast to three dimensions
+    recs = recs[:, :, np.newaxis]              # shape (R,M) -> (R,M,1)
+    sims = sims[np.newaxis, :, :]              # shape (R,M) -> (1,M,N)
+    sigs = sigs[np.newaxis, :, :]              # shape (R,M) -> (1,M,N)
+    weights = weights[np.newaxis, :, np.newaxis]   # shape (M,) -> (1,M,1) 
+
+    # calculate the sse for all records and sims at the same time
+    zs = (sims - recs) / sigs
+    sse = np.sum(weights * zs ** 2, axis=1)         # shape (R,N)
+
+    sse = pd.DataFrame(sse, index=rdf.index, columns=sdf.columns)
+
+    return sse
+
+
+def _valid_selection(rec_id, selected_records: list[pd.Series],
+                     max_count):
+    # get the data of the selected record
+    sr = pd.DataFrame(selected_records)
+    # Checks:
+    if len(sr) == 0:    # no records selected yet
+        return True
+    if (_record_or_other_component_already_selected(rec_id, sr) or      
+        _adding_exceeds_max_event_count(rec_id, sr, max_count)):
+        return False    # not a valid selection
+    return True
+
+
+def _record_or_other_component_already_selected(rec_id, selected_records):
+    # if the index, event_id and event time match then
+     # Convert Series to dict for easy column-wise comparison
+    mc = rec_id.to_dict()  # match criteria. values of candidate record
+    mc.pop(("metadata", "component"))    # no need to match
+    sr = selected_records
+    # Check if any row in 'sr' matches all values in 'rec_id'
+    is_in_sr = (sr[list(mc)] == pd.Series(mc)).all(axis=1).any()
+    return is_in_sr
+
+
+def _adding_exceeds_max_event_count(
+        rec_id: pd.Series, selected_records: pd.DataFrame, max_count: int):
+    event_counts = selected_records.groupby(("metadata", "event_id")).size()
+
+    if rec_id[("metadata","event_id")] not in event_counts.index:
+        return False
+
+    if event_counts[rec_id[("metadata","event_id")]] + 1 > max_count:
+        return True
+    return False
+
+
+def scale_records_in_db(df:pd.DataFrame, 
+                        conditioning_imt: IMT, 
+                        conditioning_iml: float):
+    """ takes a record database, conditioning_im and imtl and scales all the 
+    ims for each record appropriately. 
+    the record database must have a multilevel index with level 0 headings of
+    'ims' and level 1 headings corresponding to the imt strings. The scaled
+    ims are added as new columns under the heading 'ims_scaled'."""
+
+    # df is assumed to be a df containing only columns of ims
+    ims = df["ims"]
+    
+    # get scale factor for every record and add the new data to df
+    srdf, alpha = _scale_records_in_db(ims, conditioning_imt, conditioning_iml)
+    df = df.copy()
+    df.loc[:, ("metadata", "alpha")] = alpha.copy()
+    new_cols = pd.MultiIndex.from_product([['ims_scaled'], srdf.columns])
+    df = pd.concat([df, srdf.set_axis(new_cols, axis=1)], axis=1)
+
+    return df
+
+
+def _scale_records_in_db(
         df: pd.DataFrame, conditioning_imt: IMT, conditioning_value: float
         ) -> tuple[pd.DataFrame, pd.Series]:
     """ 
@@ -57,8 +282,8 @@ def scale_records_in_db(
     
     """
     # (n_records x 1 im)
-    sf_cond_imt = conditioning_value / df[str(conditioning_imt)] 
-    gamma = get_sf_exponent(str(conditioning_imt))
+    sf_cond_imt = conditioning_value / df[conditioning_imt.string] 
+    gamma = get_sf_exponent(conditioning_imt.name)
     # (n_records x 1 im) amplitude sf
     alpha = sf_cond_imt.to_numpy() ** (1 / gamma)  
     
@@ -95,154 +320,7 @@ def get_sf_exponent(imt_str: str) -> float:
         return SCALING_EXPONENTS["SA"]
     else:
         return SCALING_EXPONENTS[imt_str]
-    
+       
 
-def rank_by_score(
-        score_df: pd.DataFrame, k: int | None = None) -> list[list[tuple]]:
-    """
-
-    """
-    # number of records to return
-    nvals = score_df.shape[0]
-    m = score_df.shape[1]
-    if k is None:
-        k = min(m, nvals)
-
-    # get integer positions of k smallest per column
-    arr = score_df.to_numpy()
-    idx = np.argsort(arr, axis=0)[:k, :]  # shape (k, m)
-
-    # get the indices of the score_df corresponding to the ranks
-    ranked_indices = []
-    for ranked_records in idx.T:
-        ranked_indices.append(score_df.index[ranked_records].to_list())
-
-    return ranked_indices
-
-
-def stack_components(
-        eqdf: pd.DataFrame, component_tags: list[str]) -> list[pd.DataFrame]:
-    
-    dfs = [eqdf[tag].copy() for tag in component_tags]
-    eqdf = pd.concat(dfs, axis=0, keys=component_tags)
-    eqdf = eqdf.swaplevel(0, 1)
-    eqdf = eqdf.sort_index(level=0)
-
-    return eqdf
-    
-
-def scale_multiple_dbs(
-        eqdfs: list[pd.DataFrame], 
-        conditioning_imt: IMT, 
-        conditioning_im_level: float
-        ) -> dict[str, list[pd.DataFrame|pd.Series]]:
-
-    scaled_eqdbs = [
-        scale_records_in_db(db, conditioning_imt, conditioning_im_level) 
-        for db in eqdfs]
-    dfs = [i[0] for i in scaled_eqdbs]
-    alphas = [i[1] for i in scaled_eqdbs]
-    result = {"eqdfs" : dfs,
-              "alphas": alphas}
-    return  result  
-
-
-# def get_ims_of_selected_records(
-#         eqdf: pd.DataFrame, 
-#         selected_indices: list,
-#         selected_alphas: pd.Series,
-#         scaled: bool=True
-#         ) -> pd.DataFrame:
-    
-#     gm_ims = eqdf.loc[selected_indices]
-#     if scaled:
-#         gm_ims = scale_record_imts(gm_ims, selected_alphas.to_numpy())
-    
-#     return gm_ims
-
-
-def best_individual_components(
-        eqdf: pd.DataFrame,
-        component_tags: list[str],
-        conditioning_imt: IMT,
-        conditioning_imt_level: float,
-        realisations: pd.DataFrame,
-        scoring_func: Callable[[pd.DataFrame, pd.DataFrame], pd.DataFrame],
-        scaled: bool=True,
-        max_sf: float|None=None,
-        min_sf: float|None=None
-        ) -> pd.DataFrame:
-    """
-    select the best records using best_choices and the finds the corresponding
-    scaling factor using component tags and alphas and return the appropriately
-    scaled ims
-
-    The input DataFrame, df, must have a two-level MultiIndex on columns:
-      level 0: integer rank
-      level 1: ['dir', 'idx']
-
-    'idx' is the index of the record in thr original databank
-    'dir' is the component of the record (e.g. "U" or "V" for the ESM-database)
-
-    component_tags is the list containing the possible values of 'dir'
-    alphas is a list of pd.Series of n_records len where each value is the 
-    amplitude of that record
-
-    Assumes both the realisations and the ims in teh eq database are not in
-    the form ln(IM)
-    """
-    eqdf_stacked = stack_components(eqdf, component_tags) 
-    eqdf_scaled, alphas = scale_records_in_db(
-    eqdf_stacked, conditioning_imt, conditioning_imt_level)
-    
-    eqdf_scaled, alphas = filter_based_on_scale_factor(
-        eqdf_scaled, alphas, max_sf, min_sf)
-    
-    scores = scoring_func(eqdf_scaled, realisations)
-    ranked_indices = rank_by_score(scores)
-    selected_indices = select_indices(ranked_indices)
-
-    # get ims of selected records:
-    if scaled:
-        ims_of_selected_records = eqdf_scaled.loc[selected_indices]
-    else:
-        ims_of_selected_records = eqdf_stacked.loc[selected_indices]
-
-    return ims_of_selected_records
-
-
-def filter_based_on_scale_factor(
-        df: pd.DataFrame, alphas: pd.Series, 
-        max_sf: float|None, min_sf: float|None
-        ) -> tuple[pd.DataFrame, pd.Series]:
-    
-    alphas = pd.Series(alphas, index=df.index)
-
-    if max_sf and min_sf:
-        mask = (alphas < max_sf) & (alphas > min_sf)
-    elif max_sf and (not min_sf):
-        mask = alphas < max_sf
-    elif (not max_sf) and min_sf:
-        mask = alphas > min_sf
-    else:
-        return df, alphas
-    return df[mask], alphas[mask]
-
-
-def select_indices(index_lists: list[list]) -> list[tuple]:
-    """ 
-    select the highest ranking component for each column only if it has not
-    already been selected for another record.
-
-    one list for each simulated set of IMs
-    each list contains the indices of the best fit records/components in order
-    """
-    selected_indices = []
-
-    for index_list in index_lists:
-        for index in index_list:
-            if index not in selected_indices:
-                selected_indices.append(index)
-                break
-    return selected_indices
-    
+if __name__ == "__main__":
+    ...

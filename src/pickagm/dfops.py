@@ -6,75 +6,61 @@ import re
 import numpy as np
 import pandas as pd
 from openquake.hazardlib.imt import SA
+from scipy.interpolate import make_interp_spline
 
-def interpolate_for_sa(
-        df: pd.DataFrame | pd.Series, T: list[float]
-        ) -> pd.DataFrame|pd.Series|float:
-    """
-    Interpolate values for spectral accelerations.
+def interpolate_for_sa(df: pd.DataFrame | pd.Series, T: float | list[float],
+                       pga_to_small_T: bool=False):
+    
+    is_series = isinstance(df, pd.Series)
+    working_df = df.to_frame().T if is_series else df
+    
+    # Parse Periods from column headers
+    pattern = re.compile(r"SA\(([\d.]+)\)")
+    cols = [c for c in working_df.columns if pattern.search(c)]
+    periods = np.array([float(pattern.search(c).group(1)) for c in cols])
+    
+    # Sort for interpolation safety
+    idx = np.argsort(periods)
+    periods, cols = periods[idx], np.array(cols)[idx]
+    
+    T_target = np.atleast_1d(T).astype(float)
+    
+    # Handle Bounds and PGA logic
+    p_min, p_max = periods.min(), periods.max()
+    
+    if pga_to_small_T:
+        # Map 0.0 to 0.001 for both source and target if desired
+        periods = np.where(periods == 0, 1e-3, periods)
+        T_targets_interp = np.where(T_target == 0, 1e-3, T_target)
+        # Update bounds check for the mapped value
+        p_min_check = 0.001 if p_min == 0 else p_min
+    else:
+        T_targets_interp = T_target
+        p_min_check = p_min
 
-    - If `df` is a DataFrame: returns a pandas.Series (for scalar T) or 
-      DataFrame (for multiple T)
-      containing the interpolated column(s) indexed by the original rows.
-    - If `df` is a Series: returns a single float (T must be scalar).
+    # Explicit check for both lower and upper bounds
+    out_of_bounds = (T_targets_interp < p_min_check) | (T_targets_interp > p_max)
+    if np.any(out_of_bounds):
+        invalid_ts = T_targets_interp[out_of_bounds]
+        raise ValueError(
+            f"Target T {invalid_ts} out of bounds [{p_min}, {p_max}]."
+        )
 
-    Parameters
-    ----------
-    df : pandas.DataFrame or pandas.Series
-        Data containing SA columns like "SA(0.02)", "SA(0.05)", ...
-        If DataFrame, interpolation is performed for each row independently.
-        If Series, interpolation is performed on that single series.
-    T : float or array-like
-        Target period(s) [s] for which to interpolate SA.
-    im_prefix : str, default="SA"
-        The prefix identifying the spectral acceleration columns.
-    """
-    pattern = re.compile(rf"SA\(([\d.]+)\)")
-    T_arr = np.atleast_1d(T)
+    # Vectorized Interpolation
+    log_data = np.log(working_df[cols].to_numpy().T)    # interpolation axis is axis=0
+    log_periods = np.log(periods)
+    spline = make_interp_spline(log_periods, log_data, k=1)
+    
+    log_targets = np.log(T_targets_interp)
+    res_values = np.exp(spline(log_targets)).T
 
-    # Case: Series input -> return a single float (require scalar T)
-    if isinstance(df, pd.Series):
-        if T_arr.size != 1:
-            raise ValueError("When input is a Series, T must be a scalar value")
-        periods, keys = extract_keys_from_labels(pattern, df.index)
-        values = np.array([float(df[k]) for k in keys])
-        Ts = periods
-        log_data = np.log(values)
+    # Format Output
+    col_names = [f"SA({t})" for t in T_target]
+    res_df = pd.DataFrame(res_values, index=working_df.index, columns=col_names)
 
-        interp_val = np.exp(np.interp(
-            float(T_arr[0]), Ts, log_data, 
-            left=np.nan, right=np.nan))
-        if np.isnan(interp_val):
-            raise ValueError(f"Could not interpolate SA at T={T_arr[0]}")
-        return float(interp_val)
-
-    # Case: DataFrame input -> return Series (for scalar T) or DataFrame 
-    # (for multiple T)
-    if isinstance(df, pd.DataFrame):
-        periods, cols = extract_keys_from_labels(pattern, df.columns)
-        data = df[cols].to_numpy()  # shape: (n_rows, n_periods)
-        log_data = np.log(data)
-        Ts = periods
-
-        results = {}
-        for t in T_arr:
-            # interpolate each row along the SA-period axis. Log interpolation
-            interp_vals = np.exp(np.apply_along_axis(
-                lambda row: np.interp(
-                    float(t), Ts, row, left=np.nan, right=np.nan),
-                axis=1,
-                arr=log_data
-            ))
-            col_name = str(SA(float(t)))
-            if any(np.isnan(interp_vals)):
-                raise ValueError(f"Could not interpolate SA at T={float(t)}")
-        
-            results[col_name] = interp_vals
-            
-        res_df = pd.DataFrame(results, index=df.index).map(float)
-        return res_df.iloc[:, 0] if res_df.shape[1] == 1 else res_df
-
-    raise TypeError("df must be a pandas.DataFrame or pandas.Series")
+    if is_series:
+        return float(res_df.iloc[0, 0])
+    return res_df.iloc[:, 0] if len(T_target) == 1 else res_df
 
 
 def label_to_str(label) -> str:

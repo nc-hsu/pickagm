@@ -25,7 +25,8 @@ esm_nonSA_im_translations = {
 
 esm_unit_conversions = {
     str(PGA()): 1/981.0,
-    "SA": 1/981.0
+    "SA": 1/981.0,
+    "AvgSA": 1/981.0
 }
 
 def esm_multilevel_im_translations() -> dict:
@@ -91,7 +92,7 @@ def rename_sa_columns_esm(df: pd.DataFrame) -> pd.DataFrame:
         return col  # leave unchanged if no match
 
     return df.rename(columns=rename_col)
-    
+  
 
 def get_imt_df(
         df: pd.DataFrame, gm_component_tags: list[str], imts: list[IMT]
@@ -139,11 +140,11 @@ def scale_columns_for_units(
 
 def extract_im_data(df: pd.DataFrame, idx_im_data: int):
     im_df = df[df.columns[idx_im_data:]]
-    return im_df
+    return im_df.copy()
 
 
 def extract_metadata(flatfile_df: pd.DataFrame, idx_im_data: int):
-    return flatfile_df[flatfile_df.columns[:idx_im_data]]
+    return flatfile_df[flatfile_df.columns[:idx_im_data]].copy()
 
 
 def expand_SA_column_names(col_names: list[str]):
