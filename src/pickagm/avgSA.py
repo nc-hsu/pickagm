@@ -1,5 +1,5 @@
 import numpy as np
-from openquake.hazardlib.imt import IMT
+from openquake.hazardlib.imt import IMT, SA, PGA
 from openquake.hazardlib.gsim.base import GMPE
 
 def compute_ln_AvgSA(
@@ -80,7 +80,8 @@ class indirect_AvgSA_GMPE():
             rho_deltaB: np.ndarray|None = None,
             rho_deltaW: np.ndarray|None = None,
             gmm_weights: np.ndarray|None = None,
-            mean_only: bool = False):
+            mean_only: bool = False,
+            avg_periods: list[float]|None=None,):
         
         
         # either rho_total needs to be specified or 
@@ -95,7 +96,7 @@ class indirect_AvgSA_GMPE():
                     raise ValueError("Either 'rho_total' or both 'rho_deltaB' and "
                                     "'rho_deltaW must not be None")
 
-        if isinstance(gmm, GMPE):
+        if not isinstance(gmm, list):
             gmm = [gmm]
 
         if gmm_weights:
@@ -107,21 +108,30 @@ class indirect_AvgSA_GMPE():
         self.rho_dW = rho_deltaW
         self.gmm_weights = gmm_weights
         self.mean_only = mean_only
-    
+        
+        if avg_periods is not None:
+            self.imts = [SA(t) if t > 0 else PGA() for t in avg_periods]
+        else:
+            self.imts = None
+        
+
     def compute(
             self,
             ctx: np.recarray,
-            imts: IMT|list[IMT], 
+            imts: IMT|list[IMT]|None, 
             mean: np.ndarray,
             sigma: np.ndarray|None=None,
             tau: np.ndarray|None=None,
-            phi: np.ndarray|None=None,       
-            ) -> tuple[np.ndarray, np.ndarray]:
+            phi: np.ndarray|None=None) -> tuple[np.ndarray, np.ndarray]:
         
         # mean sigma tau and phi are all 1 x len(ctx) arrays instead of the
         # standard len(imts) x len(ctx) because the compute function should
         # always return None and the imts are averaged to produce a single value 
         
+        if self.imts is not None:
+            # the stored imts are used
+            imts = self.imts
+
         # the standard arrays of shape len(imts) x len(ctx) still need to be 
         # to the openquake GMPE to calculate all the im values for the ctx
         sa_mean = np.zeros((len(imts), len(ctx)))
