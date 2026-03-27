@@ -290,17 +290,39 @@ def _compute_gmm(gmm, ctx, imts):
     return mean, sig, tau, phi
 
 
-def _distribution_mean(mu_cond, sig_cond, weights, axis):
-    # expectation of a mixed distribution of log normal random variables
-    mean_val = np.sum(weights * np.exp(mu_cond + 0.5*sig_cond**2), axis=axis)
-    mean_val = mean_val.reshape((mu_cond.shape[0], -1))
+def _distribution_mean(mu_cond, weights, axis):
+    # expectation of a mixed distribution of random variables in logspace (geometric mean)
+    # returns the value in linear units, but this is not the same as the 
+    # arithmetic mean of the distribution.
+    mean_val = np.sum(weights * mu_cond, axis=axis)
+    mean_val = np.exp(mean_val.reshape((mu_cond.shape[0], -1)))
     return mean_val
+
+
+def _distribution_var(mu_cond, sig_cond, weights, axis):
+    # variance E[(X-mu)^2], of a mixed distribution (sigma^2)
+    # ln(IM)
+    # E[X] - first moment
+    mu_mix = np.sum(weights * mu_cond, axis=axis, keepdims=True)
+    # E[X^2] - second moment
+    second_moment = np.sum(weights * (sig_cond ** 2 + mu_cond ** 2), 
+                           axis=axis, keepdims=True)
+    # Variance = E[X^2] - (E[X])^2
+    var_mix =  second_moment - mu_mix ** 2
+    return var_mix
+
+
+def _distribution_sigma(mu_cond, sig_cond, weights, axis):
+    # std. deviation of a mixed distribution, ln(IM)
+    var = _distribution_var(mu_cond, sig_cond, weights, axis)
+    return var ** 0.5
 
 
 def _distribution_percentiles(percentiles, mu_cond, sig_cond, 
                              weights, im_low, im_high):
     # mu_cond: (M, N) matrix
     # im_low/im_high: (M,) vectors for each IMT
+    # returns results in linear space
     M = mu_cond.shape[0]
     num_p = len(percentiles)
     results = np.zeros((M, num_p))
@@ -329,7 +351,7 @@ def distribution_stats(imts, mu_cond, sig_cond, weights, percentiles, n_pts):
     mean_vals = []
     percentile_vals = []
     
-        # determine the pdf bounds and evaluate pdfs and cdfs
+    # determine the pdf bounds and evaluate pdfs and cdfs
     im_low = np.exp(np.min(mu_cond - 3 * sig_cond, axis=1))  #(M,)
     im_high = np.exp(np.max(mu_cond + 3 * sig_cond, axis=1))
     # Create an (M, n_pts) matrix of x-values
@@ -357,16 +379,17 @@ def distribution_stats(imts, mu_cond, sig_cond, weights, percentiles, n_pts):
         cdfs[imt.string] = np.hstack([xs.reshape(-1, 1), 
                                       cdf.reshape(-1, 1)])
             
-    # calculate point stats
-    mean_vals = _distribution_mean(mu_cond, sig_cond, weights, axis=1)
-    percentile_vals = _distribution_percentiles(
-        percentiles, mu_cond, sig_cond, weights, im_low, im_high)
+    # calculate point stats in log units
+    mean_vals = np.log(_distribution_mean(mu_cond, weights, axis=1))
+    sigma_vals = _distribution_sigma(mu_cond, sig_cond, weights, axis=1)
+    percentile_vals = np.log(_distribution_percentiles(
+        percentiles, mu_cond, sig_cond, weights, im_low, im_high))
 
     # organise the outputs:
     # vstack all of the results
-    all_stats = np.hstack([mean_vals, percentile_vals])
+    all_stats = np.hstack([mean_vals, sigma_vals, percentile_vals])
 
-    stats_labels = ["mean"] + [f"p{int(p*100)}" for p in percentiles]
+    stats_labels = ["mean", "sigma"] + [f"p{int(p*100)}" for p in percentiles]
 
     df_stats = pd.DataFrame(all_stats, 
                             index=[im.string for im in imts],
@@ -392,6 +415,7 @@ def ensemble_ks_test(record_ensemble_im_df: pd.DataFrame, target_cdfs: dict,
             continue
         
         def cdf(x):
+            x = np.array(x, dtype="float64")
             xp = target_cdfs[im][:,0]
             fp = target_cdfs[im][:,1]
             return np.interp(x, xp, fp, left=0, right=1)
@@ -424,24 +448,36 @@ def ensemble_ecdfs(record_ensemble_ims_df: pd.DataFrame):
     return ecdfs
 
 
+def ensemble_quantiles(
+        ensemble_ims_df: pd.DataFrame, qs=[0.16, 0.5, 0.84]) -> pd.DataFrame:
+    im_df = ensemble_ims_df
+
+    quantiles = []
+    for _, values in im_df.T.iterrows():
+        quantiles.append(np.quantile(values.to_numpy(), qs, method="linear"))
+
+    quantile_df = pd.DataFrame(
+        np.vstack(quantiles), 
+        index=ensemble_ims_df.columns, 
+        columns=[f"p{int(q*100)}" for q in qs])
+    
+    return quantile_df
+
+
 def ensemble_ks_bounds(target_cdfs: dict, n_sims: int, p_val:float=0.05) -> dict:
     # get upper and lower bounds for the specified p-val
-    n_a = n_sims # number of samples in the sample distribution
-
     ks_bounds = {}
     for k, cdf in target_cdfs.items():
         x_vals = np.append([0], cdf[:, 0]).reshape((-1, 1))
         y_vals = np.append([0], cdf[:, 1]).reshape((-1, 1))
-        n_b = len(cdf)  #  number of samples in the parent distribution (CDF) 
-        n_eff = np.round((n_a * n_b) / (n_a + n_b))
 
         # kstwo.ppf is the inverse of the cdf of the two-sided Smirnov distribution.
         # By using we 1-p_val we are finding the value of D that is exceeded only
         # p-val of the time by random chance. i.e. "I think a p_val fluke is rare and
         # bet that the hypothesis that they are the same is wrong" 
-        D_pval = stats.kstwo.ppf(1-p_val, n_eff)
-        upper = np.clip(y_vals + D_pval, 0, 1).reshape((-1, 1))
-        lower = np.clip(y_vals - D_pval, 0, 1).reshape((-1, 1))
+        D_pval = stats.kstwo.ppf(1-p_val, n_sims)
+        upper = np.clip(y_vals + D_pval, 0.0, 1.0).reshape((-1, 1))
+        lower = np.clip(y_vals - D_pval, 0.0, 1.0).reshape((-1, 1))
 
         ks_bounds[k] = np.hstack([x_vals, lower, y_vals, upper])
 
