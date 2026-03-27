@@ -52,6 +52,30 @@ def filter_on_sf(df, sf_bounds: tuple[float, float]|None):
     return df
 
 
+def filter_on_m(df, magnitude_bounds: tuple[float, float]|None):
+    if magnitude_bounds is not None:
+        df = _filter_on_bounds(df, ("metadata", "mag"), magnitude_bounds)
+    return df
+
+
+def filter_on_d(df, distance_bounds: tuple[float, float]|None):
+    if distance_bounds is not None:
+        df = _filter_on_bounds(df, ("metadata", "rjb"), distance_bounds)
+    return df
+                    
+
+def filter_on_vs30(df, vs30_bounds: tuple[float, float]|None):
+    if vs30_bounds is not None:
+        df = _filter_on_bounds(df, ("metadata", "vs30"), vs30_bounds)
+    return df
+
+
+def filter_by_usable_T(df, usable_T: float|None):
+    if usable_T is not None:
+            df = df[df[("metadata", "max_usable_T")] >= usable_T]
+    return df
+
+
 def pick_records(df: pd.DataFrame, 
                  scores: np.ndarray,
                  max_count: int,
@@ -90,7 +114,7 @@ def pick_records(df: pd.DataFrame,
             idxs = np.where(col == v)[0]
             for idx in idxs:        # if multiple have the same score take first
                 record = df.loc[allowable_recs[idx], :]
-                if _valid_selection(record, selected_records, max_count):
+                if valid_selection(record, pd.DataFrame(selected_records), max_count):
                     selected_records.append(record)
                     record_selected = True
                     selected_sses.append(v)
@@ -104,59 +128,6 @@ def pick_records(df: pd.DataFrame,
 
     selected_records = pd.DataFrame(selected_records)
     return selected_records 
-
-
-def greedy_optimise_for_Rscore(
-        selected_records_im_df: pd.DataFrame, 
-        records: pd.DataFrame, 
-        target_cdfs: dict, 
-        im_weights: np.ndarray,
-        p_value: float,
-        allow_early_break: bool):
-    
-    optimised = False
-    _, initial_ks_results, _ = ensemble_ks_test(selected_records_im_df, target_cdfs, p_value)
-    current_score = ensemble_r_score(initial_ks_results, im_weights)
-
-    og_record_idxs = selected_records_im_df.index.to_list()
-    current_best_records = og_record_idxs.copy()
-    current_record_idxs = og_record_idxs.copy()
-
-    for ii, _ in enumerate(og_record_idxs):
-        for new_idx in records.index.to_list():
-            
-            if new_idx in current_record_idxs:
-                # recorded already selected -> skip
-                continue
-
-            current_record_idxs[ii] = new_idx
-
-            # get the dataframe
-            new_ensemble = records.loc[current_record_idxs, :]
-
-            # do the ks_test
-            ks_pass, new_ks_results, _ = ensemble_ks_test(new_ensemble, target_cdfs, p_value)
-            new_score = ensemble_r_score(new_ks_results, im_weights)
-
-            if new_score >= current_score:
-                # no improvement
-                continue
-            
-            # if here then we have seen an improvement but not. Store and move on
-            optimised = True
-            current_best_records[ii] = new_idx
-            
-            if ks_pass and allow_early_break:
-                # we have all records passing and can break
-                break
-
-        if ks_pass and allow_early_break:
-            break
-
-    # extract the final record set and do a ks_test
-    new_ensemble = records.loc[current_best_records, :]
-    kstest_out = ensemble_ks_test(new_ensemble, target_cdfs, p_value)
-    return new_ensemble, kstest_out, optimised
 
 
 def set_weights(weights, n):
@@ -211,10 +182,10 @@ def record_sses(scaled_rec_df: pd.DataFrame, simulation_df: pd.DataFrame,
     return sse
 
 
-def _valid_selection(rec_id, selected_records: list[pd.Series],
+def valid_selection(rec_id, selected_records: pd.DataFrame,
                      max_count):
     # get the data of the selected record
-    sr = pd.DataFrame(selected_records)
+    sr = selected_records
     # Checks:
     if len(sr) == 0:    # no records selected yet
         return True
@@ -322,5 +293,9 @@ def get_sf_exponent(imt_str: str) -> float:
         return SCALING_EXPONENTS[imt_str]
        
 
+
+
+
 if __name__ == "__main__":
+
     ...
