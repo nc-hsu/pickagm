@@ -24,9 +24,10 @@ esm_nonSA_im_translations = {
 }
 
 esm_unit_conversions = {
-    str(PGA()): 1/981.0,
-    "SA": 1/981.0,
-    "AvgSA": 1/981.0
+    PGA().string: 1/981.0,  # cm/s^2 to g
+    "SA": 1/981.0,          # cm/s^2 to g
+    "AvgSA": 1/981.0,        # cm/s^2 to g
+    IA().string: 1/100      # cm/s to m/s
 }
 
 def esm_multilevel_im_translations() -> dict:
