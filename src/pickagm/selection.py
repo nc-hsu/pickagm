@@ -197,12 +197,12 @@ def valid_selection(rec_id, selected_records: pd.DataFrame,
 
 def _record_or_other_component_already_selected(rec_id, selected_records):
     # if the index, event_id and event time match then
-     # Convert Series to dict for easy column-wise comparison
-    mc = rec_id.to_dict()  # match criteria. values of candidate record
-    mc.pop(("metadata", "component"))    # no need to match
-    sr = selected_records
-    # Check if any row in 'sr' matches all values in 'rec_id'
-    is_in_sr = (sr[list(mc)] == pd.Series(mc)).all(axis=1).any()
+    # Convert Series to dict for easy column-wise comparison
+    cols_to_match = [("metadata", "event_id"), ("metadata", "station_code"), ("metadata", "location_code")] 
+    rec = rec_id[cols_to_match]  # get key columns of trial record
+    sr = selected_records[cols_to_match] # get key columns of selected records
+    # Check if any row in 'sr' matches the values of 'rec'
+    is_in_sr = (sr == rec).all(axis=1).any()
     return is_in_sr
 
 
