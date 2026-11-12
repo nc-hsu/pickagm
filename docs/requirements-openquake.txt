@@ -1,0 +1,18 @@
+# OpenQuake's pinned Linux dependencies for OpenQuake 3.26 on Python 3.12,
+# used by the Read the Docs build (.readthedocs.yaml, step 1).
+#
+# Why: openquake.engine depends on GDAL. On PyPI, GDAL is available only as
+# source code, and building it needs the matching GDAL C library, which the
+# Read the Docs machine does not have. OpenQuake publishes this requirements
+# file, which installs ready-built wheels (GDAL included) from
+# wheelhouse.openquake.org. It also pins docutils 0.19, which is why the docs
+# build uses Sphinx 7.3.
+#
+# The file is referenced, not copied, so it always matches OpenQuake's
+# 3.26 branch. Change "engine-3.26" here to build against another OpenQuake
+# release.
+-r https://raw.githubusercontent.com/gem/oq-engine/engine-3.26/requirements-py312-linux64.txt
+
+# OpenQuake itself, kept on the same 3.26 release as the pinned file above,
+# so that a newer OpenQuake with different pins is not picked up by accident.
+openquake.engine==3.26.*

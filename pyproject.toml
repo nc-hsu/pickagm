@@ -1,41 +1,110 @@
+# =============================================================================
+# Packaging configuration for pickagm.
+#
+# This file tells the build tools (pip, `python -m build`) how to turn the
+# source tree into an installable package (an sdist and a wheel), and what
+# metadata to show on PyPI. Nothing here changes how the code in
+# src/pickagm/ behaves.
+# =============================================================================
+
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+# setuptools 77 is the first release that understands the SPDX `license`
+# string and the `license-files` list used below (PEP 639).
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pickagm"
 version = "0.1.0"
 description = "A Python library for selecting ground motions for nonlinear structural response analysis under earthquake loading."
+# The README is also the long description shown on the PyPI project page.
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "GNU General Public License v3.0" }
+# SPDX licence expression (PEP 639). The full GPL v3 text is in LICENSE; the
+# credits and licences of the bundled data are in DATA_LICENCES.md. Both files
+# are copied into the wheel's metadata folder.
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE", "DATA_LICENCES.md"]
 authors = [
-    { name = "Your Name", email = "your.email@example.com" }
+    { name = "Nicholas Clemett", email = "nicholas.clemett@hsu.hamburg" }
 ]
-keywords = ["earthquake", "ground motion", "nonlinear analysis", "seismic", "engineering"]
+keywords = ["earthquake", "ground motion selection", "seismic", "engineering"]
+# Trove classifiers shown on PyPI. No licence classifier: the SPDX `license`
+# field above replaces it, and setuptools refuses to build when both exist.
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Programming Language :: Python :: 3.12",
-    "Topic :: Scientific/Engineering :: Civil Engineering",
+    "Topic :: Scientific/Engineering",
 ]
 
+# Runtime dependencies. Lower bounds only, so the package can be installed
+# next to newer releases. Exact reproduction of a past result should pin
+# versions in the project that uses pickagm, not here.
+#   - openquake.engine provides openquake.hazardlib (IMT classes, GMPEs).
+#   - scipy is used for interpolation, statistics and root finding.
+#   - h5py reads the bundled correlation coefficients (HDF5).
 dependencies = [
     "numpy>=1.26",
     "pandas>=2.2",
-    "matplotlib>=3.8.2",
+    "scipy>=1.15",
+    "h5py>=3.13",
+    "openquake.engine>=3.26",
 ]
 
 [project.optional-dependencies]
+# Tools to build the documentation (`pip install pickagm[docs]`). Read the
+# Docs installs the package with this extra (see .readthedocs.yaml).
+# OpenQuake 3.26 pins docutils to 0.19, and Sphinx 7.4 and later need a newer
+# docutils, so pip settles on Sphinx 7.3 next to OpenQuake. The lower bounds
+# are the versions the documentation was built and checked with.
+docs = [
+    "sphinx>=7.3",
+    "myst-parser>=4.0",
+    "furo>=2025.12",
+    "sphinx-copybutton>=0.5.2",
+]
+# Tools to run the test suite in tests/ (`pip install pickagm[test]`).
+test = [
+    "pytest>=9.0",
+]
 
 [project.urls]
+Homepage = "https://github.com/nc-hsu/pickagm"
+Source = "https://github.com/nc-hsu/pickagm"
+Documentation = "https://pickagm.readthedocs.io"
+Issues = "https://github.com/nc-hsu/pickagm/issues"
 
 [tool.setuptools.packages.find]
+# Look for packages inside src/ only (the "src layout"). The `src` folder
+# itself is not a package that gets installed.
 where = ["src"]
+# The data folders src/pickagm/data/ and src/pickagm/im_corr_data/ have no
+# __init__.py. With namespaces = true (the setuptools default, written out
+# here so it is visible) they are still found as sub-packages, which is what
+# lets `importlib.resources.files("pickagm.data")` in eqdbases.py work after
+# a normal install. The data files themselves are selected below.
+namespaces = true
 
 [tool.setuptools.package-data]
-pickagm = ["data/*.csv"]
+# Non-Python files to install with the package. Paths are relative to
+# src/pickagm/.
+#   - data/*.csv            the bundled ESM flatfile (read by eqdbases.py)
+#   - im_corr_data/*.hdf5   the correlation coefficients (read by corrmodels.py)
+# im_corr_data/*.csv is deliberately not listed: BB17.csv is kept in the
+# repository but no module reads it, so it is not installed.
+pickagm = ["data/*.csv", "im_corr_data/*.hdf5"]
+
+[tool.setuptools.exclude-package-data]
+# A second guard for the same rule: even if some other mechanism (for example
+# a MANIFEST.in or a version-control plugin) were to pick up every file in the
+# package folders, CSV files in im_corr_data/ are still left out of the wheel.
+pickagm = ["im_corr_data/*.csv"]
+
+[tool.pytest.ini_options]
+# Only collect tests from tests/, so pytest never imports files from src/
+# by accident.
+testpaths = ["tests"]
 
 [tool.black]
 line-length = 88

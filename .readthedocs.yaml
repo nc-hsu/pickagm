@@ -1,0 +1,39 @@
+# =============================================================================
+# Read the Docs configuration (format version 2).
+# Reference: https://docs.readthedocs.io/en/stable/config-file/v2.html
+#
+# Read the Docs reads this file on every build. It installs pickagm with its
+# real dependencies (OpenQuake included) and then runs Sphinx with
+# docs/conf.py, so the API pages are generated from the code exactly as a
+# user would import it. Nothing is mocked.
+# =============================================================================
+version: 2
+
+build:
+  # Build machine image and Python version. Python 3.12 is the oldest
+  # version pickagm supports.
+  os: ubuntu-24.04
+  tools:
+    python: "3.12"
+
+sphinx:
+  configuration: docs/conf.py
+  # Treat every Sphinx warning as an error, so the published docs are
+  # always from a clean build. The local build (sphinx-build -W) is
+  # warning-free.
+  fail_on_warning: true
+
+python:
+  install:
+    # Step 1: OpenQuake's pinned dependencies. OpenQuake needs GDAL, which
+    # PyPI only offers as source code that does not compile on the build
+    # machine. This file (see its comments) points pip at the ready-built
+    # Linux wheels that OpenQuake publishes.
+    - requirements: docs/requirements-openquake.txt
+    # Step 2: pickagm itself from this checkout (a normal, non-editable
+    # install, so the package data is installed as for a user), with the
+    # `docs` extra from pyproject.toml (Sphinx, MyST, furo, copybutton).
+    - method: pip
+      path: .
+      extra_requirements:
+        - docs

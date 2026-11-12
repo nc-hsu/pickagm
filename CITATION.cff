@@ -1,0 +1,29 @@
+# Citation metadata for pickagm, in the Citation File Format (CFF).
+# GitHub reads this file and shows a "Cite this repository" button with
+# ready-made APA and BibTeX entries. Format reference:
+# https://citation-file-format.github.io/
+#
+# No DOI is listed yet. When the v0.1.0 GitHub release has been archived
+# (for example on Zenodo), its DOI can be added here as `doi:`.
+cff-version: 1.2.0
+message: "If you use pickagm, please cite it using the metadata in this file."
+type: software
+title: "pickagm"
+abstract: >-
+  A Python library for selecting ground motions for nonlinear structural
+  response analysis under earthquake loading.
+authors:
+  - family-names: "Clemett"
+    given-names: "Nicholas"
+    email: "nicholas.clemett@hsu.hamburg"
+version: "0.1.0"
+# date-released (YYYY-MM-DD) can be added here once the release is published.
+license: "GPL-3.0-or-later"
+repository-code: "https://github.com/nc-hsu/pickagm"
+url: "https://pickagm.readthedocs.io"
+keywords:
+  - earthquake
+  - ground motion
+  - record selection
+  - seismic
+  - engineering

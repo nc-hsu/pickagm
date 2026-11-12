@@ -1,0 +1,132 @@
+# =============================================================================
+# Release workflow: build pickagm, test the built wheel, publish it to PyPI.
+#
+# It runs when a tag starting with "v" is pushed (for example v0.1.0).
+#
+#   job "build"   builds the sdist and wheel on Linux from a clean checkout,
+#                 checks them, installs the wheel into a fresh virtual
+#                 environment and runs the smoke test against it, then keeps
+#                 the files as a workflow artifact.
+#   job "publish" uploads exactly those files to PyPI with trusted
+#                 publishing (no API token is stored in GitHub). It only runs
+#                 if "build" succeeded.
+#
+# Until a trusted publisher for this repository and workflow is configured on
+# pypi.org (environment name "pypi"), the publish job fails at the upload
+# step and nothing is published. The build job is useful on its own.
+# =============================================================================
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Default for all jobs: read-only access to the repository. The publish job
+# asks for the one extra permission it needs.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test the distribution
+    runs-on: ubuntu-24.04
+    steps:
+      # Clean checkout of the tagged commit. fetch-depth: 0 gets the full
+      # history and fetch-tags gets all tags, so the record-selection-run tag
+      # is available for the comparison below.
+      - name: Check out the tagged commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # For v0.1.0 only: the package code must be byte-for-byte the code the
+      # paper's record selection ran on (tag record-selection-run, commit
+      # 9175fe6). `git diff --exit-code` prints any difference and exits
+      # with code 1, which fails the job before anything is built.
+      - name: Check that src/pickagm matches record-selection-run (v0.1.0)
+        if: github.ref_name == 'v0.1.0'
+        run: git diff --exit-code record-selection-run HEAD -- src/pickagm
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The tag and the version in pyproject.toml must agree, so that a tag
+      # such as v0.1.1 cannot publish a package that still says 0.1.0.
+      - name: Check that the tag matches the package version
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          echo "pyproject.toml version: $version, tag: $GITHUB_REF_NAME"
+          test "v$version" = "$GITHUB_REF_NAME"
+
+      # `python -m build` makes the sdist first and then builds the wheel
+      # from that sdist, so the wheel only contains what the sdist contains.
+      # Building on Linux keeps the bundled CSV with LF line endings, as it
+      # is stored in git.
+      - name: Build the sdist and wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+          python -m build
+
+      # Checks the package metadata, including that the README renders on
+      # the PyPI project page.
+      - name: Check the distribution with twine
+        run: python -m twine check --strict dist/*
+
+      # Install the wheel into a new virtual environment, outside the
+      # repository, and run the smoke test there. This is the check that the
+      # data files were packaged: an editable install would hide missing
+      # files. OpenQuake's pinned Linux requirements (the same file the Read
+      # the Docs build uses) are installed first, because OpenQuake's GDAL
+      # dependency has no ready-built wheel on PyPI.
+      - name: Install the wheel in a fresh environment and run the smoke test
+        run: |
+          python -m venv "$RUNNER_TEMP/smoke-venv"
+          venv_python="$RUNNER_TEMP/smoke-venv/bin/python"
+          "$venv_python" -m pip install --upgrade pip
+          "$venv_python" -m pip install -r docs/requirements-openquake.txt
+          "$venv_python" -m pip install dist/*.whl pytest
+          # Run from a copy of the test outside the checkout, so that
+          # nothing in the repository can be imported instead of the wheel.
+          mkdir "$RUNNER_TEMP/smoke"
+          cp tests/test_installed_package.py "$RUNNER_TEMP/smoke/"
+          cd "$RUNNER_TEMP/smoke"
+          "$venv_python" -m pytest -v test_installed_package.py
+
+      # Keep the tested files, so the publish job uploads exactly these.
+      - name: Upload the distribution as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-24.04
+    # The GitHub environment "pypi" must match the environment name given
+    # when configuring the trusted publisher on pypi.org. Protection rules
+    # (for example a required reviewer) can be added to it in the
+    # repository settings.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pickagm
+    permissions:
+      # Lets the job request a short-lived OpenID Connect token, which PyPI
+      # exchanges for upload rights (trusted publishing).
+      id-token: write
+    steps:
+      - name: Download the tested distribution
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      # Uploads every file in dist/ to PyPI using trusted publishing.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
